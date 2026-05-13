@@ -1,0 +1,31 @@
+# yardboss.conf - Example configuration
+#
+# This is a Bash file. It is sourced by yardboss.
+# You can use variables, command substitution, and shell logic.
+# Keep it simple and explicit.
+
+PROJECT_NAME="myapp"
+
+# YARDBOSS_STATE_DIR=".yardboss"
+
+# Services are started in this order.
+# They are stopped in reverse order.
+services=(api web worker)
+
+# ─── Service: api ────────────────────────────────────────────────────────────
+
+api_cmd="cd apps/api && npm run dev"
+api_port=3001
+# api_health="http://localhost:3001/health"
+
+# ─── Service: web ────────────────────────────────────────────────────────────
+
+web_cmd="cd apps/web && npm run dev"
+web_port=3000
+# web_health="http://localhost:3000/health"
+
+# ─── Service: worker ─────────────────────────────────────────────────────────
+
+worker_cmd="cd apps/worker && npm run dev"
+# worker_port=...
+# worker_health="..."

@@ -1,0 +1,810 @@
+#!/usr/bin/env bash
+#
+# yardboss - a tiny Bash process manager for local development
+#
+# Usage: yardboss <command> [service]
+#
+# Commands:
+#   start [service]    Start a service or all services
+#   stop [service]     Stop a service or all services
+#   restart [service]  Restart a service or all services
+#   status             Show status of all services
+#   logs [service]     Tail logs for a service or all services
+#   clean              Remove stale PID files
+#   doctor             Check configuration and environment
+#   help               Show usage
+
+set -euo pipefail
+
+# ─── Config ──────────────────────────────────────────────────────────────────
+
+YARDBOSS_VERSION="0.1.0"
+
+DEFAULT_CONFIG="yardboss.conf"
+DEFAULT_STATE_DIR=".yardboss"
+
+# Allow override via environment
+YARDBOSS_CONFIG="${YARDBOSS_CONFIG:-$DEFAULT_CONFIG}"
+
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+
+die() {
+  echo "yardboss: $*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<EOF
+yardboss ${YARDBOSS_VERSION}
+
+Usage: yardboss <command> [service]
+
+Commands:
+  init [--force]     Generate a yardboss.conf for this project
+  start [service]    Start a service or all services
+  stop [service]     Stop a service or all services
+  restart [service]  Restart a service or all services
+  status             Show status of all services
+  logs [service]     Tail logs for a service or all services
+  clean              Remove stale PID files
+  doctor             Check configuration and environment
+  help               Show this message
+
+Environment:
+  YARDBOSS_CONFIG    Path to config file (default: yardboss.conf)
+EOF
+}
+
+# Bash 3.2-safe variable indirection
+get_var() {
+  local var="$1"
+  printf '%s' "${!var:-}"
+}
+
+# ─── Config Loading ──────────────────────────────────────────────────────────
+
+load_config() {
+  if [[ ! -f "$YARDBOSS_CONFIG" ]]; then
+    die "missing config file: ${YARDBOSS_CONFIG}"
+  fi
+
+  # Source the config in a subshell to catch errors
+  # shellcheck source=/dev/null
+  if ! bash -n "$YARDBOSS_CONFIG"; then
+    die "config file has syntax errors: ${YARDBOSS_CONFIG}"
+  fi
+
+  # shellcheck source=/dev/null
+  source "$YARDBOSS_CONFIG"
+
+  # Validate services array exists and is non-empty
+  if [[ -z "${services:-}" ]]; then
+    die "config must define a non-empty 'services' array"
+  fi
+
+  # Set default state dir if not provided
+  YARDBOSS_STATE_DIR="${YARDBOSS_STATE_DIR:-$DEFAULT_STATE_DIR}"
+}
+
+# ─── State Directories ───────────────────────────────────────────────────────
+
+ensure_state_dirs() {
+  mkdir -p "${YARDBOSS_STATE_DIR}/pids"
+  mkdir -p "${YARDBOSS_STATE_DIR}/logs"
+}
+
+# ─── Service Validation ──────────────────────────────────────────────────────
+
+service_exists() {
+  local svc="$1"
+  local s
+  for s in "${services[@]}"; do
+    if [[ "$s" == "$svc" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+service_cmd() {
+  local svc="$1"
+  local var="${svc}_cmd"
+  get_var "$var"
+}
+
+service_port() {
+  local svc="$1"
+  local var="${svc}_port"
+  get_var "$var"
+}
+
+service_health() {
+  local svc="$1"
+  local var="${svc}_health"
+  get_var "$var"
+}
+
+validate_service() {
+  local svc="$1"
+  if ! service_exists "$svc"; then
+    die "unknown service: ${svc}"
+  fi
+  local cmd
+  cmd="$(service_cmd "$svc")"
+  if [[ -z "$cmd" ]]; then
+    die "missing command for service: ${svc}_cmd"
+  fi
+}
+
+# ─── PID / Log Files ─────────────────────────────────────────────────────────
+
+pid_file() {
+  local svc="$1"
+  printf '%s' "${YARDBOSS_STATE_DIR}/pids/${svc}.pid"
+}
+
+log_file() {
+  local svc="$1"
+  printf '%s' "${YARDBOSS_STATE_DIR}/logs/${svc}.log"
+}
+
+read_pid() {
+  local file="$1"
+  if [[ -f "$file" ]]; then
+    # Read and trim whitespace
+    local pid
+    pid="$(cat "$file" 2>/dev/null || true)"
+    printf '%s' "${pid// /}"
+  fi
+}
+
+is_pid_running() {
+  local pid="$1"
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+remove_stale_pid() {
+  local svc="$1"
+  local file
+  file="$(pid_file "$svc")"
+  local pid
+  pid="$(read_pid "$file")"
+  if [[ -n "$pid" ]] && ! is_pid_running "$pid"; then
+    rm -f "$file"
+    return 0
+  fi
+  return 1
+}
+
+is_service_running() {
+  local svc="$1"
+  local file
+  file="$(pid_file "$svc")"
+  [[ -f "$file" ]] || return 1
+  local pid
+  pid="$(read_pid "$file")"
+  [[ -n "$pid" ]] && is_pid_running "$pid"
+}
+
+# ─── Port Checks ─────────────────────────────────────────────────────────────
+
+has_lsof() {
+  command -v lsof >/dev/null 2>&1
+}
+
+port_status() {
+  local port="$1"
+  if [[ -z "$port" ]]; then
+    printf 'none'
+    return
+  fi
+  if has_lsof; then
+    if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+      printf 'listening'
+    else
+      printf 'closed'
+    fi
+  else
+    printf 'unknown'
+  fi
+}
+
+# ─── Start ───────────────────────────────────────────────────────────────────
+
+start_service() {
+  local svc="$1"
+  validate_service "$svc"
+
+  local file
+  file="$(pid_file "$svc")"
+
+  # Check if already running
+  if [[ -f "$file" ]]; then
+    local pid
+    pid="$(read_pid "$file")"
+    if is_pid_running "$pid"; then
+      echo "yardboss: ${svc}: already running (pid ${pid})"
+      return 0
+    else
+      rm -f "$file"
+    fi
+  fi
+
+  local cmd
+  cmd="$(service_cmd "$svc")"
+  local log
+  log="$(log_file "$svc")"
+
+  ensure_state_dirs
+
+  # Start the service in background, redirecting stdout/stderr to log
+  # Use bash -lc to allow shell features in cmd
+  bash -lc "$cmd" >> "$log" 2>&1 &
+  local pid=$!
+
+  # Brief wait to catch immediate failures
+  sleep 0.5
+
+  if ! is_pid_running "$pid"; then
+    die "${svc}: failed to start (process exited immediately)"
+  fi
+
+  printf '%s\n' "$pid" > "$file"
+  echo "yardboss: ${svc}: started (pid ${pid})"
+}
+
+# ─── Stop ────────────────────────────────────────────────────────────────────
+
+stop_service() {
+  local svc="$1"
+  validate_service "$svc"
+
+  local file
+  file="$(pid_file "$svc")"
+
+  if [[ ! -f "$file" ]]; then
+    echo "yardboss: ${svc}: not running"
+    return 0
+  fi
+
+  local pid
+  pid="$(read_pid "$file")"
+
+  if ! is_pid_running "$pid"; then
+    rm -f "$file"
+    echo "yardboss: ${svc}: not running (stale PID removed)"
+    return 0
+  fi
+
+  echo "yardboss: ${svc}: stopping (pid ${pid})..."
+  kill -TERM "$pid" 2>/dev/null || true
+
+  # Wait up to 5 seconds for graceful shutdown
+  local waited=0
+  while is_pid_running "$pid" && [[ $waited -lt 5 ]]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  if is_pid_running "$pid"; then
+    echo "yardboss: ${svc}: sending SIGKILL..."
+    kill -KILL "$pid" 2>/dev/null || true
+    sleep 1
+  fi
+
+  if is_pid_running "$pid"; then
+    echo "yardboss: ${svc}: warning: process still running (pid ${pid})"
+  else
+    echo "yardboss: ${svc}: stopped"
+  fi
+
+  rm -f "$file"
+}
+
+# ─── Restart ─────────────────────────────────────────────────────────────────
+
+restart_service() {
+  local svc="$1"
+  stop_service "$svc"
+  # Brief pause between stop and start
+  sleep 0.5
+  start_service "$svc"
+}
+
+# ─── Status ──────────────────────────────────────────────────────────────────
+
+status_service() {
+  local svc="$1"
+  local status="stopped"
+  local pid="-"
+  local port
+  port="$(service_port "$svc")"
+  local port_status
+  port_status="$(port_status "$port")"
+  local log
+  log="$(log_file "$svc")"
+
+  local file
+  file="$(pid_file "$svc")"
+  if [[ -f "$file" ]]; then
+    local p
+    p="$(read_pid "$file")"
+    if is_pid_running "$p"; then
+      status="running"
+      pid="$p"
+    else
+      status="stopped (stale PID)"
+    fi
+  fi
+
+  # If no port configured, show "-"
+  if [[ -z "$port" ]]; then
+    port="-"
+    port_status="-"
+  fi
+
+  printf '%-16s %-12s %-9s %-9s %-13s %s\n' \
+    "$svc" "$status" "$pid" "$port" "$port_status" "$log"
+}
+
+status_all() {
+  # Print header
+  printf '%-16s %-12s %-9s %-9s %-13s %s\n' \
+    "SERVICE" "STATUS" "PID" "PORT" "PORT_STATUS" "LOG"
+
+  local svc
+  for svc in "${services[@]}"; do
+    status_service "$svc"
+  done
+}
+
+# ─── Logs ────────────────────────────────────────────────────────────────────
+
+logs_service() {
+  local svc="$1"
+  validate_service "$svc"
+  local log
+  log="$(log_file "$svc")"
+  if [[ ! -f "$log" ]]; then
+    echo "yardboss: ${svc}: no log file yet"
+    return 0
+  fi
+  tail -n 120 -f "$log"
+}
+
+logs_all() {
+  local logs=()
+  local svc
+  for svc in "${services[@]}"; do
+    local log
+    log="$(log_file "$svc")"
+    if [[ -f "$log" ]]; then
+      logs+=("$log")
+    fi
+  done
+
+  if [[ ${#logs[@]} -eq 0 ]]; then
+    echo "yardboss: no log files found"
+    return 0
+  fi
+
+  tail -n 120 -f "${logs[@]}"
+}
+
+# ─── Clean ───────────────────────────────────────────────────────────────────
+
+clean() {
+  local removed=0
+  local svc
+  for svc in "${services[@]}"; do
+    local file
+    file="$(pid_file "$svc")"
+    if [[ -f "$file" ]]; then
+      local pid
+      pid="$(read_pid "$file")"
+      if ! is_pid_running "$pid"; then
+        rm -f "$file"
+        removed=$((removed + 1))
+        echo "yardboss: removed stale PID file for ${svc}"
+      fi
+    fi
+  done
+
+  if [[ $removed -eq 0 ]]; then
+    echo "yardboss: no stale PID files found"
+  fi
+}
+
+# ─── Doctor ──────────────────────────────────────────────────────────────────
+
+doctor() {
+  local issues=0
+
+  echo "yardboss: doctor"
+  echo ""
+
+  # Config file
+  if [[ -f "$YARDBOSS_CONFIG" ]]; then
+    echo "  [OK] config file exists: ${YARDBOSS_CONFIG}"
+  else
+    echo "  [FAIL] config file missing: ${YARDBOSS_CONFIG}"
+    issues=$((issues + 1))
+  fi
+
+  # bash exists
+  if command -v bash >/dev/null 2>&1; then
+    echo "  [OK] bash found: $(command -v bash)"
+  else
+    echo "  [FAIL] bash not found in PATH"
+    issues=$((issues + 1))
+  fi
+
+  # lsof exists (warning only)
+  if command -v lsof >/dev/null 2>&1; then
+    echo "  [OK] lsof found (port checks enabled)"
+  else
+    echo "  [WARN] lsof not found (port checks will show 'unknown')"
+  fi
+
+  # curl exists (warning only, if health checks are used)
+  if command -v curl >/dev/null 2>&1; then
+    echo "  [OK] curl found (health checks possible)"
+  else
+    echo "  [WARN] curl not found (health checks unavailable)"
+  fi
+
+  # State dir
+  local state_dir="${YARDBOSS_STATE_DIR:-$DEFAULT_STATE_DIR}"
+  if mkdir -p "${state_dir}/pids" && mkdir -p "${state_dir}/logs"; then
+    echo "  [OK] state directory writable: ${state_dir}"
+  else
+    echo "  [FAIL] cannot create state directory: ${state_dir}"
+    issues=$((issues + 1))
+  fi
+
+  # Only validate services array if config exists
+  if [[ -f "$YARDBOSS_CONFIG" ]]; then
+    # Source config into a subshell for validation
+    local svc_list
+    svc_list="$(bash -c "source \"$YARDBOSS_CONFIG\" >/dev/null 2>&1; echo \"\${services[*]}\"")"
+    if [[ -n "$svc_list" ]]; then
+      echo "  [OK] services array defined: ${svc_list}"
+
+      local s
+      for s in $svc_list; do
+        local cmd_var="${s}_cmd"
+        local cmd_val
+        cmd_val="$(bash -c "source \"$YARDBOSS_CONFIG\" >/dev/null 2>&1; echo \"\${$cmd_var:-}\"")"
+        if [[ -n "$cmd_val" ]]; then
+          echo "  [OK]   ${s}: command defined"
+        else
+          echo "  [FAIL] ${s}: missing command (${s}_cmd)"
+          issues=$((issues + 1))
+        fi
+      done
+    else
+      echo "  [FAIL] services array missing or empty"
+      issues=$((issues + 1))
+    fi
+  fi
+
+  # Check for ports already in use but not owned by yardboss
+  if [[ -f "$YARDBOSS_CONFIG" ]]; then
+    local svc_list
+    svc_list="$(bash -c "source \"$YARDBOSS_CONFIG\" >/dev/null 2>&1; echo \"\${services[*]}\"")"
+    local s
+    for s in $svc_list; do
+      local port_var="${s}_port"
+      local port_val
+      port_val="$(bash -c "source \"$YARDBOSS_CONFIG\" >/dev/null 2>&1; echo \"\${$port_var:-}\"")"
+      if [[ -n "$port_val" ]] && has_lsof; then
+        if lsof -nP -iTCP:"$port_val" -sTCP:LISTEN >/dev/null 2>&1; then
+          local pid_file_path
+          pid_file_path="$(pid_file "$s")"
+          local owned=0
+          if [[ -f "$pid_file_path" ]]; then
+            local pid
+            pid="$(read_pid "$pid_file_path")"
+            if is_pid_running "$pid"; then
+              # Check if lsof shows this PID on the port
+              if lsof -nP -iTCP:"$port_val" -sTCP:LISTEN 2>/dev/null | grep -qw "$pid"; then
+                owned=1
+              fi
+            fi
+          fi
+          if [[ $owned -eq 0 ]]; then
+            echo "  [WARN] port $port_val is listening but not owned by yardboss ($s)"
+          fi
+        fi
+      fi
+    done
+  fi
+
+  echo ""
+  if [[ $issues -eq 0 ]]; then
+    echo "yardboss: doctor passed"
+  else
+    echo "yardboss: doctor found ${issues} issue(s)"
+    return 1
+  fi
+}
+
+# ─── Init ────────────────────────────────────────────────────────────────────
+
+# Detect project type from common files.
+# Returns a short tag: node, docker, python, ruby, go, rust, unknown.
+detect_project_type() {
+  local dir="${1:-.}"
+  if [[ -f "${dir}/package.json" ]]; then
+    printf '%s' 'node'
+    return
+  fi
+  if [[ -f "${dir}/compose.yml" ]] || [[ -f "${dir}/docker-compose.yml" ]]; then
+    printf '%s' 'docker'
+    return
+  fi
+  if [[ -f "${dir}/Pipfile" ]] || [[ -f "${dir}/requirements.txt" ]] || [[ -f "${dir}/pyproject.toml" ]]; then
+    printf '%s' 'python'
+    return
+  fi
+  if [[ -f "${dir}/Gemfile" ]]; then
+    printf '%s' 'ruby'
+    return
+  fi
+  if [[ -f "${dir}/go.mod" ]]; then
+    printf '%s' 'go'
+    return
+  fi
+  if [[ -f "${dir}/Cargo.toml" ]]; then
+    printf '%s' 'rust'
+    return
+  fi
+  printf '%s' 'unknown'
+}
+
+# Generate a starter yardboss.conf. Prints the suggested config to stdout.
+generate_config() {
+  local proj_type="$1"
+  local proj_name
+  proj_name="$(basename "$(pwd)")"
+
+  echo "# yardboss.conf - Generated by 'yardboss init'"
+  echo "#"
+  echo "# Edit services, commands, and ports to match your project."
+  echo "# This is a Bash file. It is sourced by yardboss."
+  echo ""
+  echo "PROJECT_NAME=\"${proj_name}\""
+  echo ""
+  echo "# YARDBOSS_STATE_DIR=\".yardboss\""
+  echo ""
+
+  case "$proj_type" in
+    node)
+      echo "# Detected: Node.js / npm"
+      echo "#"
+      echo "services=(app)"
+      echo ""
+      echo "app_cmd=\"npm run dev\""
+      echo "app_port=3000"
+      echo ""
+      echo "# Add more services as needed:"
+      echo "# services=(api web worker)"
+      echo "# api_cmd=\"cd apps/api && npm run dev\""
+      echo "# api_port=3001"
+      echo "# web_cmd=\"cd apps/web && npm run dev\""
+      echo "# web_port=3000"
+      echo "# worker_cmd=\"cd apps/worker && npm run dev\""
+      ;;
+    docker)
+      echo "# Detected: Docker Compose"
+      echo "#"
+      echo "services=(app)"
+      echo ""
+      echo "app_cmd=\"docker compose up app\""
+      echo "app_port=3000"
+      echo ""
+      echo "# Add more services as needed:"
+      echo "# services=(db app)"
+      echo "# db_cmd=\"docker compose up db\""
+      echo "# db_port=5432"
+      echo "# app_cmd=\"docker compose up app\""
+      echo "# app_port=3000"
+      ;;
+    python)
+      echo "# Detected: Python"
+      echo "#"
+      echo "services=(app)"
+      echo ""
+      echo "app_cmd=\"python -m uvicorn main:app --reload --port 8000\""
+      echo "app_port=8000"
+      echo ""
+      echo "# Or if you use Flask:"
+      echo "# app_cmd=\"flask run --port 8000\""
+      echo "# app_port=8000"
+      echo ""
+      echo "# Or if you use Celery:"
+      echo "# services=(api worker)"
+      echo "# api_cmd=\"uvicorn main:app --reload --port 8000\""
+      echo "# api_port=8000"
+      echo "# worker_cmd=\"celery -A tasks worker -l info\""
+      ;;
+    ruby)
+      echo "# Detected: Ruby / Rails"
+      echo "#"
+      echo "services=(web)"
+      echo ""
+      echo "web_cmd=\"bin/rails server -p 3000\""
+      echo "web_port=3000"
+      echo ""
+      echo "# Add more services as needed:"
+      echo "# services=(web worker)"
+      echo "# web_cmd=\"bin/rails server -p 3000\""
+      echo "# web_port=3000"
+      echo "# worker_cmd=\"bin/bundle exec sidekiq\""
+      ;;
+    go)
+      echo "# Detected: Go"
+      echo "#"
+      echo "services=(app)"
+      echo ""
+      echo "app_cmd=\"go run ./...\""
+      echo "app_port=8080"
+      ;;
+    rust)
+      echo "# Detected: Rust / Cargo"
+      echo "#"
+      echo "services=(app)"
+      echo ""
+      echo "app_cmd=\"cargo run\""
+      echo "app_port=8080"
+      ;;
+    *)
+      echo "# No specific project type detected."
+      echo "#"
+      echo "services=(app)"
+      echo ""
+      echo "app_cmd=\"echo 'Replace this with your dev command'\""
+      echo "# app_port=3000"
+      echo ""
+      echo "# Example:"
+      echo "# services=(api web)"
+      echo "# api_cmd=\"cd apps/api && npm run dev\""
+      echo "# api_port=3001"
+      echo "# web_cmd=\"cd apps/web && npm run dev\""
+      echo "# web_port=3000"
+      ;;
+  esac
+}
+
+init() {
+  local force=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force)
+        force=1
+        ;;
+      *)
+        die "init: unknown option: $1. Use --force to overwrite existing config."
+        ;;
+    esac
+    shift
+  done
+
+  if [[ -f "$YARDBOSS_CONFIG" && $force -eq 0 ]]; then
+    die "config already exists: ${YARDBOSS_CONFIG}. Run 'yardboss init --force' to overwrite."
+  fi
+
+  local proj_type
+  proj_type="$(detect_project_type)"
+
+  echo "Detected project type: ${proj_type}"
+  echo "Generating ${YARDBOSS_CONFIG} ..."
+  echo ""
+  generate_config "$proj_type" > "$YARDBOSS_CONFIG"
+
+  echo "Created ${YARDBOSS_CONFIG}"
+  echo ""
+  echo "Next steps:"
+  echo "  1. Review and edit ${YARDBOSS_CONFIG}"
+  echo "  2. Run 'yardboss doctor' to check your config"
+  echo "  3. Run 'yardboss start' to start your services"
+}
+
+# ─── Target Iteration ────────────────────────────────────────────────────────
+
+run_for_target() {
+  local action="$1"
+  shift
+  if [[ $# -gt 0 ]]; then
+    local svc
+    for svc in "$@"; do
+      validate_service "$svc"
+      "$action" "$svc"
+    done
+  else
+    local svc
+    for svc in "${services[@]}"; do
+      "$action" "$svc"
+    done
+  fi
+}
+
+run_for_target_reverse() {
+  local action="$1"
+  shift
+  if [[ $# -gt 0 ]]; then
+    local svc
+    for svc in "$@"; do
+      validate_service "$svc"
+      "$action" "$svc"
+    done
+  else
+    local i
+    local idx
+    local count=${#services[@]}
+    for ((i = count - 1; i >= 0; i--)); do
+      idx=$((i))
+      local svc="${services[$idx]}"
+      "$action" "$svc"
+    done
+  fi
+}
+
+# ─── Main ────────────────────────────────────────────────────────────────────
+
+main() {
+  local cmd="${1:-help}"
+
+  case "$cmd" in
+    help | --help | -h)
+      usage
+      ;;
+    init)
+      shift
+      init "$@"
+      ;;
+    doctor)
+      # doctor can work without loading config fully, but tries to read it
+      doctor
+      ;;
+    start)
+      load_config
+      shift
+      run_for_target start_service "$@"
+      ;;
+    stop)
+      load_config
+      shift
+      run_for_target_reverse stop_service "$@"
+      ;;
+    restart)
+      load_config
+      shift
+      run_for_target_reverse stop_service "$@"
+      echo ""
+      run_for_target start_service "$@"
+      ;;
+    status)
+      load_config
+      status_all
+      ;;
+    logs)
+      load_config
+      shift
+      if [[ $# -eq 0 ]]; then
+        logs_all
+      else
+        logs_service "$1"
+      fi
+      ;;
+    clean)
+      load_config
+      clean
+      ;;
+    *)
+      die "unknown command: ${cmd}. Try: yardboss help"
+      ;;
+  esac
+}
+
+main "$@"
