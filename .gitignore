@@ -1,0 +1,9 @@
+# Yardboss state directory
+.yardboss/
+
+# Editor files
+*~
+*.swp
+*.swo
+.DS_Store
+.arbor/
