@@ -36,7 +36,7 @@ need to run together without turning your terminal into a crime scene.
 Copy the script into your project:
 
 ```bash
-curl -L -o yardboss https://github.com/yourname/yardboss/raw/main/yardboss
+curl -L -o yardboss https://github.com/b7r-dev/yardboss/raw/main/yardboss
 chmod +x yardboss
 ./yardboss init         # Generates a starter yardboss.conf
 ```
@@ -44,7 +44,7 @@ chmod +x yardboss
 Or clone it:
 
 ```bash
-git clone https://github.com/yourname/yardboss.git
+git clone https://github.com/b7r-dev/yardboss.git
 cd yardboss
 chmod +x yardboss
 ./yardboss init         # Generates a starter yardboss.conf
