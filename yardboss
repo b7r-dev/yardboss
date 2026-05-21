@@ -140,12 +140,14 @@ validate_service() {
 
 pid_file() {
   local svc="$1"
-  printf '%s' "${YARDBOSS_STATE_DIR}/pids/${svc}.pid"
+  local state_dir="${YARDBOSS_STATE_DIR:-$DEFAULT_STATE_DIR}"
+  printf '%s' "${state_dir}/pids/${svc}.pid"
 }
 
 log_file() {
   local svc="$1"
-  printf '%s' "${YARDBOSS_STATE_DIR}/logs/${svc}.log"
+  local state_dir="${YARDBOSS_STATE_DIR:-$DEFAULT_STATE_DIR}"
+  printf '%s' "${state_dir}/logs/${svc}.log"
 }
 
 read_pid() {
